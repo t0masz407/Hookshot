@@ -7,22 +7,50 @@
 // Against one-frame flashes: the picture before (`hist`, this pass's own last output) bounds each pixel, which may
 // rise to 1.5x and fall to 0.6x of it in a frame (a light change or a camera cut settles over a few frames). Some
 // frames' scene colour blows up to white across the picture (or a light term drops out for a frame); those frames
-// came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid = 0 (the first frame, a
+// came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid bit 0 = 0 (the first frame, a
 // new size): no bound.
+//
+// Edges (pc.valid bit 1, the gameplay stand-in): FXAA (the console variant) on the input, in its perceptual encoding. The
+// network smoothed them; a plain linear upscale left every edge stair-stepped, and hair, foliage and thin edges shimmer
+// as they move. The network reads the scene colour alone (no motion, no depth), so a filter of one frame stands in for
+// it: temporal accumulation without motion vectors smears everything that moves (see the clamp above).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
 layout(binding = 2, r11f_g11f_b10f) uniform image2D hist;
 layout(push_constant) uniform P { ivec2 size; int valid; } pc;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// (FXAA's console variant: the edge's direction from four half-texel taps, two blends along it, the wider one kept
+// unless it leaves the neighbourhood's luma range)
+vec3 fxaa(vec2 uv, vec3 m) {
+    const vec2 px = 1.0 / vec2(textureSize(src, 0));
+    const float nw = luma(textureLod(src, uv + vec2(-0.5, -0.5) * px, 0.0).rgb);
+    const float ne = luma(textureLod(src, uv + vec2(0.5, -0.5) * px, 0.0).rgb);
+    const float sw = luma(textureLod(src, uv + vec2(-0.5, 0.5) * px, 0.0).rgb);
+    const float se = luma(textureLod(src, uv + vec2(0.5, 0.5) * px, 0.0).rgb);
+    const float lm = luma(m);
+    const float lo = min(lm, min(min(nw, ne), min(sw, se)));
+    const float hi = max(lm, max(max(nw, ne), max(sw, se)));
+    if (hi - lo < max(1.0 / 24.0, hi * 0.125)) return m;   // (no edge: the plain sample, flat areas stay sharp)
+    vec2 dir = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    const float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), -8.0, 8.0) * px;
+    const vec3 a = 0.5 * (textureLod(src, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
+                          textureLod(src, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+    const vec3 b = a * 0.5 + 0.25 * (textureLod(src, uv - dir * 0.5, 0.0).rgb + textureLod(src, uv + dir * 0.5, 0.0).rgb);
+    const float lb = luma(b);
+    return lb < lo || lb > hi ? a : b;
+}
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
     const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
     // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
     // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
-    const vec3 s = textureLod(src, uv, 0.0).rgb;
+    vec3 s = textureLod(src, uv, 0.0).rgb;
+    if ((pc.valid & 2) != 0) s = fxaa(uv, s);
     vec3 c = s * s;
-    if (pc.valid != 0) {
+    if ((pc.valid & 1) != 0) {
         const vec3 p = imageLoad(hist, g).rgb;
         c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
         c = clamp(c, p * 0.6, p * 1.5 + 0.01);
