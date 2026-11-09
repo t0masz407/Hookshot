@@ -24,15 +24,17 @@ float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 // ends (12 steps at most), the pixel moved across the edge by its place on that span; and the sub-pixel blend, which
 // softens the features thinner than a pixel (hair, twigs) that no span describes. On the input, at its texel size)
 float L(vec2 uv) { return luma(textureLod(src, uv, 0.0).rgb); }
-vec3 fxaa(vec2 uv, vec3 rgbM, out bool moved) {
-    moved = false;
+vec3 fxaa(vec2 uv, vec3 rgbM, out int moved) {
+    moved = 0;
     const vec2 px = 1.0 / vec2(textureSize(src, 0));
     const float m = luma(rgbM);
     float n = L(uv + vec2(0.0, -px.y)), s = L(uv + vec2(0.0, px.y));
     const float e = L(uv + vec2(px.x, 0.0)), w = L(uv + vec2(-px.x, 0.0));
     const float hi = max(max(max(n, s), max(e, w)), m), lo = min(min(min(n, s), min(e, w)), m);
     const float range = hi - lo;
-    if (range < max(0.0312, hi * 0.125)) return rgbM;   // (no edge: flat areas keep their plain sample)
+    // (FXAA's high-quality thresholds: with 0.125 / 0.0312 it also took the moss, cloth and leaf textures for edges and
+    // softened them)
+    if (range < max(0.0833, hi * 0.166)) return rgbM;   // (no edge: flat areas and fine textures keep their plain sample)
     const float nw = L(uv - px), se = L(uv + px), ne = L(uv + vec2(px.x, -px.y)), sw = L(uv + vec2(-px.x, px.y));
     const float ns = n + s, we = w + e, nesw = ne + sw + nw + se;
     const float edge_h = abs(-2.0 * w + nw + sw) + abs(-2.0 * m + ns) * 2.0 + abs(-2.0 * e + ne + se);
@@ -62,9 +64,10 @@ vec3 fxaa(vec2 uv, vec3 rgbM, out bool moved) {
     const float span_off = good ? 0.5 - min(dn, dp) / (dn + dp) : 0.0;
     const float sub = clamp(abs((ns * 2.0 + we * 2.0 + nesw) / 12.0 - m) / range, 0.0, 1.0);
     const float sub_f = (-2.0 * sub + 3.0) * sub * sub;
-    const float off = max(span_off, sub_f * sub_f * 0.75);
+    const float sub_off = sub_f * sub_f * 0.5;   // (half the blend of FXAA's default 0.75: textures stay sharper)
+    const float off = max(span_off, sub_off);
     if (horz) uv.y += off * step; else uv.x += off * step;
-    moved = off > 0.0;
+    moved = span_off >= 0.1 && span_off >= sub_off ? 1 : sub_off >= 0.1 ? 2 : 0;   // (1: along an edge, 2: sub-pixel)
     return textureLod(src, uv, 0.0).rgb;
 }
 void main() {
@@ -74,9 +77,10 @@ void main() {
     // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
     // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
     vec3 s = textureLod(src, uv, 0.0).rgb;
-    bool moved = false;
+    int moved = 0;
     if ((pc.valid & 2) != 0) s = fxaa(uv, s, moved);
-    if ((pc.valid & 4) != 0 && moved) s = vec3(1.0, 0.0, 0.0);   // (RX_VK_TAAU_FXAA=2: the pixels it changed, in red)
+    // (RX_VK_TAAU_FXAA=2: the pixels it moved by a tenth of a texel or more: red along an edge, blue the sub-pixel blend)
+    if ((pc.valid & 4) != 0 && moved != 0) s = moved == 1 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.3, 1.0);
     vec3 c = s * s;
     if ((pc.valid & 1) != 0) {
         const vec3 p = imageLoad(hist, g).rgb;
