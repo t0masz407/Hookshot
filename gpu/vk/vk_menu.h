@@ -7,7 +7,7 @@ namespace mkwvk {
 
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {
-    int framegen = 0;     // made frames: 0 off, or 2, 3, 4 times the game's frames
+    int framegen = 0;     // made frames: 0 off, 1 Auto (to the display's refresh), or 2 to 8 times the game's frames
     int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
     int resolution = 0;   // the 3D's: 0 Auto (the game's dynamic resolution), else 100%, 75%, 67%, 50% of its full scale (nx2/oot_patches.py)
     int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080 (host/nn_applet.c)
@@ -56,7 +56,7 @@ int menu_heart_protection();
 int menu_player_flight();
 int menu_free_camera();
 int menu_take_cheat_action();
-void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
+void menu_note_frame(bool game_frame, int shown = 1);   // (the frame rates the FPS counter shows)
 /// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);
 /// (hookshot) The start-up screen while the shaders are prepared (vk_main.cpp, vk_startup_paint.h), drawn by menu_record under the
