@@ -1,9 +1,11 @@
-"""Frame generation's Auto: as many frames a game frame as fill the display's refresh, changed only when it settles.
+"""Frame generation's Auto: a frame for each of the display's refreshes, at its place between the game's frames.
 
-The real auto_cap, multiplier and auto_multiplier of gpu/vk/vk_framegen.cpp, with the display's refresh and the game's
-frame time set by the fixture: 45 fps on 60 Hz makes 2x and on 120 Hz 3x, 60 fps on 60 Hz none, the most is the
-refresh over 30 fps (2x to 4x), a new multiplier waits for 30 game frames asking for it, and an unknown refresh counts
-as 60 Hz.
+The real auto_cap, multiplier and auto_slots of gpu/vk/vk_framegen.cpp, with the display's refresh set by the fixture:
+45 fps on 60 Hz gives one refresh to two game frames in three and two to the third (60 shown a second, three of four
+made, at 3/4, 1/2 and 1/4), 60 fps on 60 Hz one refresh a frame at the game's own frame, faster than the display some
+game frames none, 45 fps on 120 Hz 120 a second; the most a game frame may be given is the refresh over 30 fps (2 to
+4), a timeline outside the interval starts again at the game's frame, and display_refresh_mhz is declared where
+vk_main.cpp defines it (in the unnamed namespace the shared library linked with it undefined).
 python -I -B tests/test_framegen_auto.py [--cxx g++]
 """
 import argparse
@@ -32,58 +34,68 @@ PREFIX = r'''#include <algorithm>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 constexpr int kMaxMult = 8;
 struct { int framegen = 1; } opts;
-struct { int64_t game_ns = 0; int auto_m = 0, auto_want = 0, auto_count = 0; } fg;
 static int refresh_mhz = 60000;
 int display_refresh_mhz() { return refresh_mhz; }
-static int logged;
-void logf(const char*, ...) { logged++; }
 '''
 
 MAIN = r'''
-static void reset(int mhz, double game_fps) {
-    refresh_mhz = mhz;
-    fg = {};
-    fg.game_ns = (int64_t)(1e9 / game_fps);
-}
-static int settle(int frames) {
-    int m = 0;
-    for (int i = 0; i < frames; i++) m = auto_multiplier(auto_cap());
-    return m;
+/* a second of game frames at fps on a display at hz: the refreshes given, and the made ones' places */
+struct Run { int shown = 0, made = 0, most = 0, none = 0; float min_t = 1, max_t = 0; };
+static Run second(double fps, int hz) {
+    refresh_mhz = hz * 1000;
+    const int64_t period = (int64_t)(1e12 / refresh_mhz), frame = (int64_t)(1e9 / fps);
+    int64_t next = 0, last = 1000000000;
+    Run r;
+    for (int i = 0; i < (int)fps; i++) {
+        const int64_t now = last + frame;
+        float t[kMaxMult];
+        int64_t at[kMaxMult];
+        const int n = auto_slots(last, now, period, next, t, at, auto_cap());
+        for (int k = 0; k < n; k++) {
+            CHECK(t[k] > 0 && t[k] <= 1.0001f);
+            CHECK(at[k] > last && at[k] <= now);
+            if (k) CHECK(at[k] - at[k - 1] == period);       /* a refresh apart */
+            if (t[k] <= 0.999f) r.made++, r.min_t = std::min(r.min_t, t[k]), r.max_t = std::max(r.max_t, t[k]);
+        }
+        r.shown += n, r.most = std::max(r.most, n), r.none += n == 0;
+        last = now;
+    }
+    return r;
 }
 int main() {
-    reset(60000, 45);
-    CHECK(auto_cap() == 2 && multiplier() == 2);        /* 60 Hz: two images a set at most */
-    CHECK(settle(1) == 2);                              /* 45 fps on 60 Hz: 2x */
-    reset(120000, 45);
+    refresh_mhz = 60000;
+    CHECK(auto_cap() == 2 && multiplier() == 2);
+    Run r = second(45, 60);
+    CHECK(r.shown >= 59 && r.shown <= 61);                   /* the display's 60, not 2x's 90 */
+    CHECK(r.most == 2 && r.none == 0);
+    CHECK(r.made >= 43 && r.made <= 46);                     /* three of four made */
+    CHECK(r.min_t > 0.2f && r.max_t < 0.8f);                 /* at 1/4, 1/2, 3/4 */
+    r = second(60, 60);
+    CHECK(r.shown >= 59 && r.shown <= 61 && r.most == 1);    /* none made, or one a frame at most */
+    r = second(75, 60);
+    CHECK(r.shown >= 59 && r.shown <= 61 && r.none > 0);     /* faster than the display: some frames given none */
+    refresh_mhz = 120000;
     CHECK(auto_cap() == 4);
-    CHECK(settle(1) == 3);                              /* 45 fps on 120 Hz: 3x (135 shown, the display's 120 filled) */
-    reset(60000, 60);
-    CHECK(settle(1) == 1);                              /* 60 fps on 60 Hz: none made */
-    reset(60000, 59);
-    CHECK(settle(1) == 1);                              /* (just under: still none, the 0.15 margin) */
-    reset(144000, 36);
-    CHECK(auto_cap() == 4 && settle(1) == 4);           /* 144 Hz, 36 fps: 4x */
-    reset(240000, 30);
-    CHECK(auto_cap() == 4 && settle(1) == 4);           /* the most is 4x, whatever the refresh */
-    reset(0, 45);
-    CHECK(auto_cap() == 2 && settle(1) == 2);           /* unknown refresh: as 60 Hz */
+    r = second(45, 120);
+    CHECK(r.shown >= 117 && r.shown <= 121 && r.most == 3);   /* (the first frame starts the timeline: one) */
+    refresh_mhz = 240000;
+    CHECK(auto_cap() == 4);                                  /* the most is 4, whatever the refresh */
+    r = second(30, 240);
+    CHECK(r.shown >= 117 && r.shown <= 121 && r.most == 4);  /* capped: 4 of the 8 refreshes a frame */
+    refresh_mhz = 0;
+    CHECK(auto_cap() == 2);                                  /* unknown: as 60 Hz */
 
-    reset(120000, 45);
-    CHECK(settle(1) == 3);
-    fg.game_ns = (int64_t)(1e9 / 70);                   /* the game speeds up to 70 fps: 2x is enough */
-    logged = 0;
-    CHECK(settle(29) == 3);                             /* not before 30 frames ask for it */
-    CHECK(settle(1) == 2 && logged == 1);
-    fg.game_ns = (int64_t)(1e9 / 45);                   /* a single slow frame and back: no change */
-    CHECK(auto_multiplier(auto_cap()) == 2);
-    fg.game_ns = (int64_t)(1e9 / 70);
-    CHECK(settle(40) == 2);
+    int64_t next = 5;                                        /* a timeline behind the interval (a hitch) */
+    float t[kMaxMult];
+    int64_t at[kMaxMult];
+    CHECK(auto_slots(1000, 2000, 300, next, t, at, 4) == 1 && at[0] == 2000 && t[0] == 1.0f && next == 2300);
+    CHECK(auto_slots(2000, 2000, 300, next, t, at, 4) == 0); /* no interval */
 
     opts.framegen = 3;
-    CHECK(multiplier() == 3);                           /* a fixed setting is not Auto's */
+    CHECK(multiplier() == 3);                                /* a fixed setting is not Auto's */
     opts.framegen = 0;
     CHECK(multiplier() == 1);
-    std::printf("PASS: Auto fills the display's refresh and changes only once it settles\n");
+    std::printf("PASS: Auto gives each of the display's refreshes a frame, and no more\n");
 }
 '''
 
@@ -93,7 +105,10 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     source = (ROOT / "gpu" / "vk" / "vk_framegen.cpp").read_text(encoding="utf-8")
-    fixture = PREFIX + "\n".join(block(source, m) for m in ("int auto_cap()", "int multiplier()", "int auto_multiplier(")) + MAIN
+    decl = source.index("int display_refresh_mhz();")
+    if source.find("namespace {") < decl:
+        raise SystemExit("display_refresh_mhz is declared in the unnamed namespace: vk_main.cpp's is another function")
+    fixture = PREFIX + "\n".join(block(source, m) for m in ("int auto_cap()", "int multiplier()", "int auto_slots(")) + MAIN
     with tempfile.TemporaryDirectory(prefix="framegen-auto-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"
