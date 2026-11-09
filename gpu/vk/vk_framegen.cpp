@@ -16,6 +16,8 @@
 #include <mutex>
 #include <thread>
 
+#include <cmath>
+
 #include "vk_framegen.h"
 #include "vk_menu.h"
 #include "vk_texture.h"
@@ -72,6 +74,8 @@ struct State {
     OutSet* recorded = nullptr;   // (the set the last framegen_record filled, for framegen_queue)
     int64_t recorded_at = 0;
     int mult = 0;   // (the multiplier the sets' frames were made for)
+    int64_t game_ns = 0;          // (Auto: the game's frame time, smoothed)
+    int auto_m = 0, auto_want = 0, auto_count = 0;   // (Auto: the multiplier now, the one asked for, for how many frames)
 } fg;
 
 // Used only by present_image, whose lock serializes direct and interpolated presents.
@@ -87,7 +91,38 @@ int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-int multiplier() { return std::clamp(opts.framegen, 1, kMaxMult); }   // (the Insert menu; 1: the game's frames alone)
+int display_refresh_mhz();   // (vk_main.cpp)
+
+// (hookshot) Frame generation's Auto (the menu's 1): as many frames a game frame as fill the display's refresh, chosen
+// again as the game's frame rate moves: 45 fps on a 60 Hz display 2x, on 120 Hz 3x; at 60 fps on 60 Hz none are made.
+// The sets' frames are made once for the most it may ask for (a display's refresh over 30 fps, 2x to 4x: 4x at 4K is
+// twelve 33 MB images), so a change costs no reallocation. An unknown refresh counts as 60 Hz.
+int auto_cap() {
+    const int hz = (display_refresh_mhz() + 500) / 1000;
+    return std::clamp(hz > 0 ? (hz + 29) / 30 : 2, 2, 4);
+}
+int multiplier() {   // (the Insert menu; 1 Auto (its most); the game's frames alone at 0)
+    return opts.framegen == 1 ? auto_cap() : std::clamp(opts.framegen, 1, kMaxMult);
+}
+/// Auto's multiplier for the next game frame: the display's refresh over the game's rate, rounded up past 0.15 (so 59 fps
+/// on 60 Hz makes none), changed only when the new one has been asked for 30 game frames running (half a second)
+int auto_multiplier(int most) {
+    const int mhz = display_refresh_mhz();
+    const double period = 1e12 / (mhz > 0 ? mhz : 60000);
+    const double ideal = fg.game_ns > 0 ? (double)fg.game_ns / period : 1.0;
+    const int want = std::clamp((int)std::ceil(ideal - 0.15), 1, most);
+    if (!fg.auto_m) fg.auto_m = want;
+    if (want == fg.auto_m) {
+        fg.auto_count = 0;
+    } else if (want == fg.auto_want && ++fg.auto_count >= 30) {
+        logf("vk: frame interpolation: Auto %dx -> %dx (the game at %.0f fps, the display at %.0f Hz)", fg.auto_m, want,
+             1e9 / (double)fg.game_ns, (mhz > 0 ? mhz : 60000) / 1000.0);
+        fg.auto_m = want, fg.auto_count = 0;
+    } else if (want != fg.auto_want) {
+        fg.auto_want = want, fg.auto_count = 1;
+    }
+    return std::min(fg.auto_m, most);
+}
 
 /// A compute pipeline over bindings of these types (push descriptors), push constants of push bytes
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<VkDescriptorType> types, uint32_t push,
@@ -339,7 +374,7 @@ void display_main() {
 // reduced it to luma (framegen_record), then a second thread showed it. Open areas paid for that on a full GPU and
 // gained no made frames. 2x and up is the interpolation; RX_VK_FRAMEGEN=0 keeps it off entirely.
 bool framegen_wanted(int menu_value, int allow) {
-    return allow && menu_value >= 2;
+    return allow && menu_value >= 1;   // (1: Auto)
 }
 
 bool framegen_on() {
@@ -426,6 +461,8 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     }
     const int64_t now = now_ns();
     const bool gap = fg.last_at && now - fg.last_at > 100000000;   // (a loading hitch: nothing to blend)
+    if (fg.last_at && !gap)
+        fg.game_ns = fg.game_ns ? (fg.game_ns * 7 + (now - fg.last_at)) / 8 : now - fg.last_at;
     fg.last_at = now;
     OutSet* set;
     {
@@ -435,7 +472,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
     }
-    const int cur = fg.cur, prev = cur ^ 1, m = multiplier();
+    const int cur = fg.cur, prev = cur ^ 1, m = opts.framegen == 1 ? auto_multiplier(fg.mult) : multiplier();
     const bool blend = fg.have_prev && !gap;
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
