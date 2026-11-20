@@ -354,6 +354,7 @@ struct TextMask {
     int w = 0, h = 0;
     std::vector<uint8_t> cov;
 };
+#ifdef _WIN32
 HFONT text_font(int px) {
     return CreateFontA(-px, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                        DEFAULT_PITCH, "Segoe UI");
@@ -443,6 +444,11 @@ TextMask text_mask(const char* s, int px, int pad) {
     DeleteDC(dc);
     return m;
 }
+#else
+// Linux: host/posix has no GDI stand-in any more (70391859), so the wheel draws no text here
+void text_size(const char* s, int px, int* w, int* h) { *w = (int)(std::strlen(s) * px * 0.55f), *h = px; }
+TextMask text_mask(const char*, int, int) { return {}; }
+#endif
 // text with a dark outline o pixels wide, centred on (cx, cy)
 void text(Canvas& c, const char* s, int px, float cx, float cy, const Rgba& col, int o) {
     if (!*s) return;
